@@ -7,8 +7,8 @@ import nntools.tracker.metrics as NNmetrics
 import numpy as np
 import torch
 from nntools import SupervisedExperiment
-from nntools.tracker import log_artifact, log_metrics, log_params
 from nntools.utils import reduce_tensor
+import nntools.dataset as D
 from networks import get_network
 
 
@@ -25,6 +25,7 @@ class DA(IntFlag):
             return name
         else:
             return ', '.join([flag.name for flag in DA if flag in self])
+
 
 
 da_funcs = {DA.NONE: [],
@@ -48,34 +49,65 @@ da_funcs = {DA.NONE: [],
             }
 
 
+@D.nntools_wrapper
+def to_rgb(image):
+    if image.ndim == 2:
+        image = np.expand_dims(image, 2)
+    if image.shape[2]==1:
+        image = np.repeat(image, 3, 2)
+
+    return {'image':image}
+
+
+
+
 class SegInprintExp(SupervisedExperiment):
     def __init__(self, config, id=None,
                  da_level=(DA.COLOR | DA.GEOMETRIC)):
         super(SegInprintExp, self).__init__(config, id)
         network = get_network(config['Network'])
         self.set_model(network)
-
         self.da_level = da_level
+
+        dataset = D.SegmentationDataset(**self.c['Dataset'])
+        v_size = self.c['Validation']['size']
+        train_dataset, valid_dataset = D.random_split(dataset, [len(dataset) - v_size, v_size])
+        test_dataset = D.SegmentationDataset(self.c['Test']['img_url'], shape=self.c['Dataset']['shape'],
+                                             keep_size_ratio=True)
+
+        # Data augmentation
         aug_func = da_funcs[da_level]
         aug = A.Compose(aug_func)
-        ops = [aug, A.Normalize(mean=self.config['Preprocessing']['mean'],
-                                std=self.config['Preprocessing']['std'],
+        ops = [aug, A.Normalize(mean=self.c['Preprocessing']['mean'],
+                                std=self.c['Preprocessing']['std'],
                                 always_apply=True)]
-        if self.config['Preprocessing']['random_crop']:
-            ops.append(A.CropNonEmptyMaskIfExists(*self.config['Preprocessing']['crop_size'], always_apply=True))
+
+        if self.c['Preprocessing']['random_crop']:
+            ops.append(A.CropNonEmptyMaskIfExists(*self.c['Preprocessing']['crop_size'], always_apply=True))
+
+        composer_train = D.Composition()
+        composer_train.add(*ops)
+        train_dataset.set_composition(composer_train)
+
+        composer_test = D.Composition()
+
+        test_funcs = [to_rgb, A.PadIfNeeded(pad_height_divisor=2**4, pad_width_divisor=2**4, min_height=None, min_width=None),
+                      A.Normalize(mean=self.c['Preprocessing']['mean'], std=self.c['Preprocessing']['std'],
+                                  always_apply=True)]
+
+        composer_test.add(*test_funcs)
+
+        valid_dataset.set_composition(composer_test)
+        test_dataset.set_composition(composer_test)
 
         self.set_train_dataset(train_dataset)
         self.set_valid_dataset(valid_dataset)
         self.set_test_dataset(test_dataset)
         """
-        Configure the test set
-        """
-
-        """
         Define optimizers
         """
-        self.set_optimizer(**self.config['Optimizer'])
-        self.set_scheduler(**self.config['Learning_rate_scheduler'])
+        self.set_optimizer(**self.c['Optimizer'])
+        self.set_scheduler(**self.c['Learning_rate_scheduler'])
         self.log_artifacts(os.path.realpath(__file__))
         self.log_params(DA=self.da_level.name)
         print("Training size %i, validation size %i, test size %i" % (len(self.train_dataset),
@@ -88,14 +120,25 @@ class SegInprintExp(SupervisedExperiment):
         model.load(self.tracker.network_savepoint, load_most_recent=True, map_location=map_location, strict=False,
                    filtername='best_valid')
         model.eval()
+        self.test_dataset.return_indices = True
         test_loader, test_sampler = self.get_dataloader(self.test_dataset, shuffle=False, batch_size=1,
                                                         rank=rank)
         with torch.no_grad():
             for batch in test_loader:
                 img = batch['image'].cuda(gpu)
-                gt = batch['mask'].cuda(gpu)
+                index = batch['indice']
                 probas = model(img)
-                probas = torch.sigmoid(probas)
+                preds = torch.argmax(probas, 1).float()
+                preds = preds
+                filenames = self.test_dataset.filename(index)
+                for p, f in zip(preds, filenames):
+                    p = p.cpu().numpy().astype(np.uint8)
+                    h, w = p.shape
+                    prediction = np.zeros((h, w, 3), dtype=np.uint8)
+                    prediction[p == 1, 0] = 255
+                    prediction[p == 2, 2] = 255
+                    filename = os.path.join(self.tracker.save_paths['prediction_savepoint'], f).replace('tif', 'png')
+                    cv2.imwrite(filename, prediction)
 
     def validate(self, model, valid_loader, iteration, rank=0, loss_function=None):
         model.eval()
@@ -117,7 +160,7 @@ class SegInprintExp(SupervisedExperiment):
         if self.is_main_process(rank):
             stats = NNmetrics.report_cm(confMat)
             stats['mIoU'] = mIoU
-            log_metrics(self.tracker, step=iteration, **stats)
+            self.log_metrics(step=iteration, **stats)
             if self.tracked_metric is None or mIoU >= self.tracked_metric:
                 self.tracked_metric = mIoU
                 filename = ('best_valid_iteration_%i_mIoU_%.3f' % (iteration, mIoU)).replace('.', '')
